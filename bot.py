@@ -2,15 +2,16 @@ import os
 import io
 import ast
 import json
+import time
 import random
 import string
+import threading
 import logging
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
 import qrcode
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -22,18 +23,13 @@ from telegram.ext import (
     filters,
 )
 
-import database as db
-
-load_dotenv()
+# ==================== CONFIG — ONLY BOT_TOKEN FROM ENV ====================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing. Add it in Railway variables.")
+    raise SystemExit("❌ BOT_TOKEN missing. Add it in Railway Variables.")
 
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-except ValueError:
-    ADMIN_ID = 0
+BOT_USERNAME = "PT88B88_45Bot"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,17 +37,115 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PT88B88_45Bot")
 
-# ---------- Config ----------
-BOT_USERNAME = "PT88B88_45Bot"
+# ==================== DATABASE (JSON file, single file) ====================
 
-try:
-    PROMO_CODES = json.loads(
-        os.getenv("PROMO_CODES", '{"PT88B88":150,"BONUS100":100,"WELCOME50":50,"LUCKY777":77}')
-    )
-except Exception:
-    PROMO_CODES = {"PT88B88": 150, "BONUS100": 100, "WELCOME50": 50, "LUCKY777": 77}
+DB_PATH = "data.json"          # Railway default working dir — no extra env needed
+LOCK = threading.Lock()
 
-# (label, base points, weight)
+
+def _empty_user(user_id: int):
+    return {
+        "id": user_id,
+        "points": 0,
+        "spins_total": 0,
+        "last_spin_date": None,
+        "last_daily_date": None,
+        "streak": 0,
+        "referred_by": None,
+        "referrals": [],
+        "used_promos": [],
+        "created_at": int(time.time()),
+        "username": None,
+        "first_name": None,
+    }
+
+
+def _load():
+    if not os.path.exists(DB_PATH):
+        return {"users": {}}
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"users": {}}
+
+
+def _save(data):
+    tmp = DB_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DB_PATH)
+
+
+def get_user(user_id: int):
+    with LOCK:
+        data = _load()
+        uid = str(user_id)
+        if uid not in data["users"]:
+            data["users"][uid] = _empty_user(user_id)
+            _save(data)
+        return data["users"][uid]
+
+
+def update_user(user_id: int, **fields):
+    with LOCK:
+        data = _load()
+        uid = str(user_id)
+        if uid not in data["users"]:
+            data["users"][uid] = _empty_user(user_id)
+        data["users"][uid].update(fields)
+        _save(data)
+        return data["users"][uid]
+
+
+def add_points(user_id: int, amount: int):
+    with LOCK:
+        data = _load()
+        uid = str(user_id)
+        if uid not in data["users"]:
+            data["users"][uid] = _empty_user(user_id)
+        data["users"][uid]["points"] = data["users"][uid].get("points", 0) + amount
+        _save(data)
+        return data["users"][uid]["points"]
+
+
+def get_leaderboard(limit=10):
+    with LOCK:
+        data = _load()
+        users = list(data["users"].values())
+    users.sort(key=lambda u: u.get("points", 0), reverse=True)
+    return users[:limit]
+
+
+def get_all_users():
+    with LOCK:
+        data = _load()
+        return list(data["users"].values())
+
+
+def total_points_in_system():
+    with LOCK:
+        data = _load()
+        return sum(u.get("points", 0) for u in data["users"].values())
+
+
+def today_str():
+    return date.today().isoformat()
+
+
+def yesterday_str():
+    return (date.today() - timedelta(days=1)).isoformat()
+
+
+# ==================== BONUS CONFIG (hardcoded) ====================
+
+PROMO_CODES = {
+    "PT88B88": 150,
+    "BONUS100": 100,
+    "WELCOME50": 50,
+    "LUCKY777": 77,
+}
+
 SPIN_SEGMENTS = [
     ("😢 0 pts", 0, 15),
     ("🪙 5 pts", 5, 20),
@@ -60,7 +154,7 @@ SPIN_SEGMENTS = [
     ("🌟 20 pts", 20, 12),
     ("🔥 25 pts", 25, 8),
     ("🎁 30 pts", 30, 6),
-    ("👑 100 pts VIP JACKPOT!", 100, 2),
+    ("👑 100 pts JACKPOT!", 100, 2),
     ("💥 50 pts", 50, 2),
 ]
 
@@ -70,18 +164,6 @@ STREAK_CAP = 50
 REFERRAL_REWARD = 50
 REFERRAL_NEW_BONUS = 25
 JACKPOT_BASE = 1000
-
-USER_LAST_CMD = {}
-COOLDOWN_SECONDS = 1.0
-
-
-def rate_limited(user_id: int) -> bool:
-    now = datetime.utcnow().timestamp()
-    last = USER_LAST_CMD.get(user_id, 0)
-    if now - last < COOLDOWN_SECONDS:
-        return True
-    USER_LAST_CMD[user_id] = now
-    return False
 
 
 def weighted_spin():
@@ -107,24 +189,24 @@ def vip_tier(points: int):
     return "🥉 Bronze", 1.0, "Standard rewards"
 
 
-# ==================== CORE ====================
+# ==================== CORE COMMANDS ====================
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    u = db.get_user(user.id)
-    db.update_user(user.id, username=user.username, first_name=user.first_name)
+    u = get_user(user.id)
+    update_user(user.id, username=user.username, first_name=user.first_name)
 
     if ctx.args and ctx.args[0].startswith("ref_"):
         try:
             referrer_id = int(ctx.args[0].replace("ref_", ""))
             if referrer_id != user.id and u.get("referred_by") is None:
-                db.update_user(user.id, referred_by=referrer_id)
-                db.add_points(referrer_id, REFERRAL_REWARD)
-                db.add_points(user.id, REFERRAL_NEW_BONUS)
-                ref_u = db.get_user(referrer_id)
+                update_user(user.id, referred_by=referrer_id)
+                add_points(referrer_id, REFERRAL_REWARD)
+                add_points(user.id, REFERRAL_NEW_BONUS)
+                ref_u = get_user(referrer_id)
                 refs = ref_u.get("referrals", [])
                 refs.append(user.id)
-                db.update_user(referrer_id, referrals=refs)
+                update_user(referrer_id, referrals=refs)
                 try:
                     await ctx.bot.send_message(
                         referrer_id,
@@ -138,7 +220,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    u = db.get_user(user.id)
+    u = get_user(user.id)
     tier_name, _, _ = vip_tier(u.get("points", 0))
 
     keyboard = [
@@ -215,8 +297,8 @@ async def id_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def spin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    u = db.get_user(user.id)
-    today = db.today_str()
+    u = get_user(user.id)
+    today = today_str()
 
     if u.get("last_spin_date") == today:
         return await update.message.reply_text(
@@ -229,9 +311,9 @@ async def spin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tier_name, multiplier, _ = vip_tier(u.get("points", 0))
     final_points = int(points * multiplier)
 
-    db.update_user(user.id, last_spin_date=today)
-    db.update_user(user.id, spins_total=u.get("spins_total", 0) + 1)
-    new_balance = db.add_points(user.id, final_points)
+    update_user(user.id, last_spin_date=today)
+    update_user(user.id, spins_total=u.get("spins_total", 0) + 1)
+    new_balance = add_points(user.id, final_points)
 
     bonus_line = ""
     if final_points > points:
@@ -247,9 +329,9 @@ async def spin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    u = db.get_user(user.id)
-    today = db.today_str()
-    yesterday = db.yesterday_str()
+    u = get_user(user.id)
+    today = today_str()
+    yesterday = yesterday_str()
 
     if u.get("last_daily_date") == today:
         return await update.message.reply_text("⏳ You already claimed today's bonus!")
@@ -261,8 +343,8 @@ async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         streak = 1
 
     bonus = min(DAILY_BASE + (streak - 1) * STREAK_BONUS, DAILY_BASE + STREAK_CAP)
-    db.update_user(user.id, streak=streak, last_daily_date=today)
-    new_balance = db.add_points(user.id, bonus)
+    update_user(user.id, streak=streak, last_daily_date=today)
+    new_balance = add_points(user.id, bonus)
 
     await update.message.reply_text(
         f"🎁 <b>Daily bonus claimed!</b>\n\n"
@@ -280,7 +362,7 @@ async def redeem_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Usage: /redeem <code>\nExample: /redeem PT88B88"
         )
     user = update.effective_user
-    u = db.get_user(user.id)
+    u = get_user(user.id)
     code = ctx.args[0].strip().upper()
 
     if code not in PROMO_CODES:
@@ -292,8 +374,8 @@ async def redeem_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     reward = PROMO_CODES[code]
     used.append(code)
-    db.update_user(user.id, used_promos=used)
-    new_balance = db.add_points(user.id, reward)
+    update_user(user.id, used_promos=used)
+    new_balance = add_points(user.id, reward)
 
     await update.message.reply_text(
         f"🎟️ <b>Promo redeemed!</b>\n"
@@ -305,7 +387,7 @@ async def redeem_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = db.get_user(update.effective_user.id)
+    u = get_user(update.effective_user.id)
     tier_name, _, _ = vip_tier(u.get("points", 0))
     await update.message.reply_text(
         f"💰 <b>Your Balance</b>\n"
@@ -319,7 +401,7 @@ async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def streak_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = db.get_user(update.effective_user.id)
+    u = get_user(update.effective_user.id)
     streak = u.get("streak", 0)
     next_bonus = min(DAILY_BASE + streak * STREAK_BONUS, DAILY_BASE + STREAK_CAP)
     await update.message.reply_text(
@@ -332,7 +414,7 @@ async def streak_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def vip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = db.get_user(update.effective_user.id)
+    u = get_user(update.effective_user.id)
     points = u.get("points", 0)
     tier_name, multiplier, perks = vip_tier(points)
 
@@ -368,12 +450,12 @@ async def vip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def jackpot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    total = db.total_points_in_system()
+    total = total_points_in_system()
     pool = JACKPOT_BASE + total // 10
     await update.message.reply_text(
         f"💥 <b>Weekly Jackpot Pool</b>\n\n"
         f"Current pool: <b>{pool} pts</b>\n"
-        f"Participants: <b>{len(db.get_all_users())}</b>\n\n"
+        f"Participants: <b>{len(get_all_users())}</b>\n\n"
         f"🎯 Every Monday the top 3 users split the pool:\n"
         f"🥇 50% – 🥈 30% – 🥉 20%\n\n"
         f"<i>Jackpot rewards are virtual points only — no cash value.</i>",
@@ -382,7 +464,7 @@ async def jackpot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    top = db.get_leaderboard(10)
+    top = get_leaderboard(10)
     if not top:
         return await update.message.reply_text("No users yet. Be the first to /spin!")
     lines = ["🏆 <b>Top 10 Users</b>\n"]
@@ -407,7 +489,7 @@ async def refer_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def referrals_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = db.get_user(update.effective_user.id)
+    u = get_user(update.effective_user.id)
     refs = u.get("referrals", [])
     if not refs:
         return await update.message.reply_text(
@@ -423,7 +505,7 @@ async def referrals_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    u = db.get_user(user.id)
+    u = get_user(user.id)
     joined = datetime.utcfromtimestamp(u.get("created_at", 0)).strftime("%Y-%m-%d")
     tier_name, _, _ = vip_tier(u.get("points", 0))
     await update.message.reply_text(
@@ -442,7 +524,7 @@ async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db.update_user(
+    update_user(
         user.id,
         points=0, streak=0, spins_total=0, referrals=[],
         used_promos=[],
@@ -701,7 +783,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "redeem":
         await q.message.reply_text("Use /redeem <code> to redeem a promo code.")
     elif data == "balance":
-        u = db.get_user(q.from_user.id)
+        u = get_user(q.from_user.id)
         tier_name, _, _ = vip_tier(u.get("points", 0))
         await q.message.reply_text(
             f"💰 <b>{u['points']} points</b>\n"
@@ -710,7 +792,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
     elif data == "vip":
-        u = db.get_user(q.from_user.id)
+        u = get_user(q.from_user.id)
         tier_name, multiplier, perks = vip_tier(u.get("points", 0))
         await q.message.reply_text(
             f"👑 <b>{tier_name}</b>\n"
@@ -719,7 +801,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
     elif data == "leaderboard":
-        top = db.get_leaderboard(5)
+        top = get_leaderboard(5)
         lines = ["🏆 <b>Top 5</b>"]
         for i, u in enumerate(top):
             name = u.get("first_name") or u.get("username") or f"User{u['id']}"
